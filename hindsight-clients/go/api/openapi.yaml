@@ -6729,6 +6729,9 @@ components:
         store_document_text:
           nullable: true
           type: boolean
+        default_timezone:
+          nullable: true
+          type: string
         enable_auto_consolidation:
           nullable: true
           type: boolean
