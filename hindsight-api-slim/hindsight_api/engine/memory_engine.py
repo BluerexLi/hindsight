@@ -966,6 +966,51 @@ def _build_llm(
     return MultiLLMProvider([base, *extra], strategy)
 
 
+async def verify_llm_connections(configs: "list[tuple[str, LLMConfig | MultiLLMProvider]]") -> None:
+    """Probe each startup LLM config, fail-open and bounded (#1166, #6136).
+
+    The probes run in parallel and each is capped at _LLM_PROBE_TIMEOUT_SECONDS:
+    a busy backend that queues the probe behind long jobs must not hold startup
+    for the whole model-init budget (and then fail it), since a failed probe only
+    warns anyway. A multi-LLM chain is probed member by member, so a slow failover
+    member never hides a healthy primary.
+
+    One probe per distinct provider/model/endpoint, deduped after chains are
+    expanded: an operation whose model is already queued (as a plain config or as a
+    chain member) adds nothing, while the same model on a second host (a common
+    failover setup) is still probed. Deduping chains by their primary, as before, skipped a chain's
+    failover members whenever another config shared that primary.
+    """
+
+    async def verify(config_name: str, llm_config: LLMConfig) -> None:
+        try:
+            await asyncio.wait_for(llm_config.verify_connection(), timeout=_LLM_PROBE_TIMEOUT_SECONDS)
+        except Exception as e:
+            reason = f"no answer within {_LLM_PROBE_TIMEOUT_SECONDS:g}s" if isinstance(e, TimeoutError) else str(e)
+            logger.warning(
+                "LLM connection verification failed for '%s' config: %s. "
+                "Server will start but LLM-dependent operations may fail "
+                "until the provider is available.",
+                config_name,
+                reason,
+            )
+
+    probes: list[tuple[str, LLMConfig]] = []
+    seen: set[tuple[str | None, str | None, str | None]] = set()
+    for name, cfg in configs:
+        members = (
+            [(f"{name} ({m.provider}/{m.model})", m) for m in cfg.members]
+            if isinstance(cfg, MultiLLMProvider)
+            else [(name, cfg)]
+        )
+        for probe_name, member in members:
+            key = (member.provider, member.model, member.base_url)
+            if key not in seen:
+                seen.add(key)
+                probes.append((probe_name, member))
+    await asyncio.gather(*(verify(name, cfg) for name, cfg in probes))
+
+
 async def validate_retain_batch_support(retain_llm_config: "LLMConfig | MultiLLMProvider", config: ConfigLike) -> None:
     """Fail startup when batch retain is enabled but nothing configured can serve it.
 
@@ -6162,34 +6207,15 @@ class MemoryEngine(MemoryEngineInterface):
             provider becomes available (e.g. after a quota reset).
             """
             if not self._skip_llm_verification:
-                # One probe per distinct provider/model: an operation whose config
-                # matches one already queued adds nothing.
-                configs_to_verify: list[tuple[str, LLMConfig | MultiLLMProvider]] = []
-                seen: set[tuple[str | None, str | None]] = set()
-                for config_name, llm_config in (
-                    ("default", self._llm_config),
-                    ("retain", self._retain_llm_config),
-                    ("reflect", self._reflect_llm_config),
-                    ("consolidation", self._consolidation_llm_config),
-                    ("mental model refresh", self._mental_model_refresh_llm_config),
-                ):
-                    key = (llm_config.provider, llm_config.model)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    configs_to_verify.append((config_name, llm_config))
-
-                for config_name, llm_config in configs_to_verify:
-                    try:
-                        await llm_config.verify_connection()
-                    except Exception as e:
-                        logger.warning(
-                            "LLM connection verification failed for '%s' config: %s. "
-                            "Server will start but LLM-dependent operations may fail "
-                            "until the provider is available.",
-                            config_name,
-                            e,
-                        )
+                await verify_llm_connections(
+                    [
+                        ("default", self._llm_config),
+                        ("retain", self._retain_llm_config),
+                        ("reflect", self._reflect_llm_config),
+                        ("consolidation", self._consolidation_llm_config),
+                        ("mental model refresh", self._mental_model_refresh_llm_config),
+                    ]
+                )
 
                 # Validate batch API compatibility: if retain_batch_enabled is
                 # set, the retain LLM configuration must actually be able to
@@ -6223,9 +6249,9 @@ class MemoryEngine(MemoryEngineInterface):
         except TimeoutError as e:
             raise RuntimeError(
                 f"Model/connection initialization did not complete within "
-                f"{init_timeout:g}s. A model load (embeddings/cross-encoder) or LLM "
-                f"verification is likely blocked — e.g. an offline model download or "
-                f"an unreachable provider. Increase {ENV_MODEL_INIT_TIMEOUT} if the "
+                f"{init_timeout:g}s. A model load (embeddings/cross-encoder) is "
+                f"likely blocked — e.g. an offline model download or an unreachable "
+                f"embeddings/reranker provider. Increase {ENV_MODEL_INIT_TIMEOUT} if the "
                 f"first-time model download legitimately needs more time."
             ) from e
 
